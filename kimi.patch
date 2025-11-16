@@ -1,0 +1,250 @@
+Subject: [PATCH] **feat(translator): add support for reasoning/thinking content blocks in OpenAI-Claude and Gemini responses**
+---
+Index: internal/translator/claude/claude/claude_claude_response.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/internal/translator/claude/claude/claude_claude_response.go b/internal/translator/claude/claude/claude_claude_response.go
+new file mode 100644
+--- /dev/null	(date 1763290438317)
++++ b/internal/translator/claude/claude/claude_claude_response.go	(date 1763290438317)
+@@ -0,0 +1,132 @@
++package claude
++
++import (
++	"context"
++	"strings"
++
++	"github.com/tidwall/gjson"
++)
++
++// FilterClaudeResponseStream removes duplicated content_block_stop events emitted by Claude.
++// Claude occasionally sends a stop event that only carries a signature delta immediately before
++// the actual stop notification. This translator buffers SSE event blocks so we can drop the
++// redundant signature-only events while emitting the canonical stop event.
++func FilterClaudeResponseStream(_ context.Context, _ string, _, _, rawJSON []byte, param *any) []string {
++	if *param == nil {
++		*param = &claudeSelfStreamState{}
++	}
++	state := (*param).(*claudeSelfStreamState)
++	return state.consume(rawJSON)
++}
++
++// PassthroughClaudeResponse returns non-streaming responses unchanged.
++func PassthroughClaudeResponse(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) string {
++	return string(rawJSON)
++}
++
++type claudeSelfStreamState struct {
++	pendingLines     []string
++	pendingEventName string
++	pendingData      strings.Builder
++	hasPendingEvent  bool
++
++	lastEmittedEvent    string
++	lastEmittedIndex    int64
++	lastEmittedHasIndex bool
++}
++
++func (s *claudeSelfStreamState) consume(raw []byte) []string {
++	line := strings.TrimRight(string(raw), "\r")
++	trimmed := strings.TrimSpace(line)
++
++	// Forward keep-alive comment lines as-is.
++	if strings.HasPrefix(line, ":") {
++		return []string{line + "\n"}
++	}
++
++	var out []string
++	switch {
++	case trimmed == "":
++		out = append(out, s.flush()...)
++	case strings.HasPrefix(line, "event:"):
++		out = append(out, s.flush()...)
++		s.pendingLines = []string{line}
++		s.pendingEventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
++		s.hasPendingEvent = true
++	case strings.HasPrefix(line, "data:"):
++		if !s.hasPendingEvent && len(s.pendingLines) == 0 {
++			s.hasPendingEvent = true
++		}
++		s.pendingLines = append(s.pendingLines, line)
++		payload := strings.TrimLeft(line[len("data:"):], " ")
++		if s.pendingData.Len() > 0 {
++			s.pendingData.WriteByte('\n')
++		}
++		s.pendingData.WriteString(payload)
++	default:
++		// Include any other SSE fields (e.g., id:, retry:) inside the event block.
++		s.pendingLines = append(s.pendingLines, line)
++	}
++
++	return out
++}
++
++func (s *claudeSelfStreamState) flush() []string {
++	if len(s.pendingLines) == 0 {
++		return nil
++	}
++
++	var out []string
++	eventPayload := s.pendingData.String()
++	eventType := s.pendingEventName
++	var eventIndex int64
++	eventHasIndex := false
++	if eventPayload != "" {
++		payloadResult := gjson.Parse(eventPayload)
++		if eventType == "" {
++			eventType = payloadResult.Get("type").String()
++		}
++		if idx := payloadResult.Get("index"); idx.Exists() {
++			eventIndex = idx.Int()
++			eventHasIndex = true
++		}
++
++		if eventType == "content_block_stop" {
++			deltaType := payloadResult.Get("delta.type").String()
++			if deltaType == "signature_delta" {
++				s.resetPending()
++				return nil
++			}
++			if s.lastEmittedEvent == "content_block_stop" {
++				if eventHasIndex && s.lastEmittedHasIndex && s.lastEmittedIndex == eventIndex {
++					s.resetPending()
++					return nil
++				}
++				if !eventHasIndex && !s.lastEmittedHasIndex {
++					s.resetPending()
++					return nil
++				}
++			}
++		}
++	}
++
++	block := strings.Join(s.pendingLines, "\n") + "\n\n"
++	out = append(out, block)
++
++	// Update last emitted event markers.
++	s.lastEmittedEvent = eventType
++	s.lastEmittedHasIndex = eventHasIndex
++	if eventHasIndex {
++		s.lastEmittedIndex = eventIndex
++	}
++
++	s.resetPending()
++	return out
++}
++
++func (s *claudeSelfStreamState) resetPending() {
++	s.pendingLines = nil
++	s.pendingEventName = ""
++	s.pendingData.Reset()
++	s.hasPendingEvent = false
++}
+Index: internal/translator/claude/claude/claude_claude_request.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/internal/translator/claude/claude/claude_claude_request.go b/internal/translator/claude/claude/claude_claude_request.go
+new file mode 100644
+--- /dev/null	(date 1763289820144)
++++ b/internal/translator/claude/claude/claude_claude_request.go	(date 1763289820144)
+@@ -0,0 +1,9 @@
++package claude
++
++import "bytes"
++
++// ConvertClaudeRequestToClaude is a passthrough converter for Claude requests.
++// We still clone the payload to avoid mutating caller buffers.
++func ConvertClaudeRequestToClaude(_ string, inputRawJSON []byte, _ bool) []byte {
++	return bytes.Clone(inputRawJSON)
++}
+Index: internal/translator/init.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/internal/translator/init.go b/internal/translator/init.go
+--- a/internal/translator/init.go	(revision 4eab1414106d583c0d2a6c677fc33a9d5b0e8f71)
++++ b/internal/translator/init.go	(date 1763290084141)
+@@ -1,6 +1,7 @@
+ package translator
+ 
+ import (
++	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/claude"
+ 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/gemini"
+ 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/gemini-cli"
+ 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/openai/chat-completions"
+Index: internal/translator/claude/claude/init.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/internal/translator/claude/claude/init.go b/internal/translator/claude/claude/init.go
+new file mode 100644
+--- /dev/null	(date 1763289811676)
++++ b/internal/translator/claude/claude/init.go	(date 1763289811676)
+@@ -0,0 +1,19 @@
++package claude
++
++import (
++	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/translator"
++)
++
++func init() {
++	translator.Register(
++		Claude,
++		Claude,
++		ConvertClaudeRequestToClaude,
++		interfaces.TranslateResponse{
++			Stream:    FilterClaudeResponseStream,
++			NonStream: PassthroughClaudeResponse,
++		},
++	)
++}
+Index: internal/runtime/executor/claude_executor.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+--- a/internal/runtime/executor/claude_executor.go	(revision 4eab1414106d583c0d2a6c677fc33a9d5b0e8f71)
++++ b/internal/runtime/executor/claude_executor.go	(date 1763290438361)
+@@ -215,32 +215,7 @@
+ 				log.Errorf("response body close error: %v", errClose)
+ 			}
+ 		}()
+-
+-		// If from == to (Claude → Claude), directly forward the SSE stream without translation
+-		if from == to {
+-			scanner := bufio.NewScanner(decodedBody)
+-			buf := make([]byte, 20_971_520)
+-			scanner.Buffer(buf, 20_971_520)
+-			for scanner.Scan() {
+-				line := scanner.Bytes()
+-				appendAPIResponseChunk(ctx, e.cfg, line)
+-				if detail, ok := parseClaudeStreamUsage(line); ok {
+-					reporter.publish(ctx, detail)
+-				}
+-				// Forward the line as-is to preserve SSE format
+-				cloned := make([]byte, len(line)+1)
+-				copy(cloned, line)
+-				cloned[len(line)] = '\n'
+-				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+-			}
+-			if errScan := scanner.Err(); errScan != nil {
+-				recordAPIResponseError(ctx, e.cfg, errScan)
+-				reporter.publishFailure(ctx)
+-				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+-			}
+-			return
+-		}
+-
++		
+ 		// For other formats, use translation
+ 		scanner := bufio.NewScanner(decodedBody)
+ 		buf := make([]byte, 20_971_520)
