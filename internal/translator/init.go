@@ -1,6 +1,7 @@
 package translator
 
 import (
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/claude"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/gemini"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/gemini-cli"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/openai/chat-completions"
